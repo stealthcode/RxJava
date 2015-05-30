@@ -17,13 +17,22 @@
 package rx.observables;
 
 import java.util.Arrays;
-import java.util.concurrent.atomic.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
-import rx.*;
+import rx.Observable;
 import rx.Observable.OnSubscribe;
+import rx.Producer;
+import rx.Subscriber;
+import rx.Subscription;
 import rx.annotations.Experimental;
 import rx.exceptions.CompositeException;
-import rx.functions.*;
+import rx.functions.Action0;
+import rx.functions.Action1;
+import rx.functions.Actions;
+import rx.functions.Func0;
+import rx.functions.Func2;
 import rx.internal.operators.BackpressureUtils;
 
 /**
@@ -35,18 +44,18 @@ import rx.internal.operators.BackpressureUtils;
  * <ul>
  *  <li>should either
  *   <ul>
- *   <li>create the next value and signal it via {@link SubscriptionState#onNext state.onNext()},</li>
- *   <li>signal a terminal condition via {@link SubscriptionState#onError state.onError()}, or
- *       {@link SubscriptionState#onCompleted state.onCompleted()}, or</li>
- *   <li>signal a stop condition via {@link SubscriptionState#stop state.stop()} indicating no further values
+ *   <li>create the next value and signal it via {@link BackPressureSubscriber#onNext state.onNext()},</li>
+ *   <li>signal a terminal condition via {@link BackPressureSubscriber#onError state.onError()}, or
+ *       {@link BackPressureSubscriber#onCompleted state.onCompleted()}, or</li>
+ *   <li>signal a stop condition via {@link BackPressureSubscriber#stop state.stop()} indicating no further values
  *       will be sent.</li>
  *   </ul>
  *  </li>
  *  <li>may
  *   <ul>
- *   <li>call {@link SubscriptionState#onNext state.onNext()} and either
- *       {@link SubscriptionState#onError state.onError()} or
- *       {@link SubscriptionState#onCompleted state.onCompleted()} together, and
+ *   <li>call {@link BackPressureSubscriber#onNext state.onNext()} and either
+ *       {@link BackPressureSubscriber#onError state.onError()} or
+ *       {@link BackPressureSubscriber#onCompleted state.onCompleted()} together, and
  *   <li>block or sleep.
  *   </ul>
  *  </li>
@@ -61,23 +70,23 @@ import rx.internal.operators.BackpressureUtils;
  *  </li>
  * </ul>
  * 
- * The {@link SubscriptionState} object features counters that may help implement a state machine:
+ * The {@link BackPressureSubscriber} object features counters that may help implement a state machine:
  * <ul>
- * <li>A call counter, accessible via {@link SubscriptionState#calls state.calls()} tells how many times the
+ * <li>A call counter, accessible via {@link BackPressureSubscriber#calls state.calls()} tells how many times the
  *     {@code next()} was run (zero based).</li>
- * <li>You can use a phase counter, accessible via {@link SubscriptionState#phase state.phase}, that helps track
+ * <li>You can use a phase counter, accessible via {@link BackPressureSubscriber#phase state.phase}, that helps track
  *     the current emission phase, in a {@code switch()} statement to implement the state machine. (It is named
  *     {@code phase} to avoid confusion with the per-subscriber state.)</li>
  * <li>You can arbitrarily change the current phase with
- *     {@link SubscriptionState#advancePhase state.advancePhase()}, 
- *     {@link SubscriptionState#advancePhaseBy(int) state.advancedPhaseBy(int)} and
- *     {@link SubscriptionState#phase(int) state.phase(int)}.</li>
+ *     {@link BackPressureSubscriber#advancePhase state.advancePhase()}, 
+ *     {@link BackPressureSubscriber#advancePhaseBy(int) state.advancedPhaseBy(int)} and
+ *     {@link BackPressureSubscriber#phase(int) state.phase(int)}.</li>
  * </ul>
  * <p>
- * When you implement {@code AbstractOnSubscribe}, you may override {@link AbstractOnSubscribe#onSubscribe} to
+ * When you implement {@code AbstractOnSubscribe}, you may override {@link AbstractOnSubscribe#onStart} to
  * perform special actions (such as registering {@code Subscription}s with {@code Subscriber.add()}) and return
  * additional state for each subscriber subscribing. You can access this custom state with the
- * {@link SubscriptionState#state state.state()} method. If you need to do some cleanup, you can override the
+ * {@link BackPressureSubscriber#state state.state()} method. If you need to do some cleanup, you can override the
  * {@link #onTerminated} method.
  * <p>
  * For convenience, a lambda-accepting static factory method, {@link #create}, is available.
@@ -152,18 +161,17 @@ import rx.internal.operators.BackpressureUtils;
  */
 @Experimental
 public abstract class AbstractOnSubscribe<T, S> implements OnSubscribe<T> {
+    protected S dataState;
+
     /**
      * Called when a Subscriber subscribes and lets the implementor create a per-subscriber custom state.
      * <p>
      * Override this method to have custom state per-subscriber. The default implementation returns
      * {@code null}.
      *
-     * @param subscriber the subscriber who is subscribing
      * @return the custom state
      */
-    protected S onSubscribe(Subscriber<? super T> subscriber) {
-        return null;
-    }
+    protected abstract S onStart();
 
     /**
      * Called after the terminal emission or when the downstream unsubscribes.
@@ -180,16 +188,30 @@ public abstract class AbstractOnSubscribe<T, S> implements OnSubscribe<T> {
     /**
      * Override this method to create an emission state-machine.
      *
-     * @param state the per-subscriber subscription state
+     * @param subscriptionState the per-subscriber subscription state
+     * @param dataState the data emitted from the call to {@link #onSubscribe(Subscriber)} (if this is 
+     *          the first invocation of next) or returned by the previous invocation of next. 
      */
-    protected abstract void next(SubscriptionState<T, S> state);
+    protected abstract S next(BackPressureSubscriber<T> subscriptionState, S dataState);
 
     @Override
-    public final void call(final Subscriber<? super T> subscriber) {
-        final S custom = onSubscribe(subscriber);
-        final SubscriptionState<T, S> state = new SubscriptionState<T, S>(this, subscriber, custom);
-        subscriber.add(new SubscriptionCompleter<T, S>(state));
-        subscriber.setProducer(new SubscriptionProducer<T, S>(state));
+    public void call(final Subscriber<? super T> subscriber) {
+        dataState = onStart();
+        Action1<BackPressureSubscriber<T>> nextDelegator = new Action1<BackPressureSubscriber<T>>() {
+            @Override
+            public void call(BackPressureSubscriber<T> subscriber) {
+                dataState = next(subscriber, dataState);
+            }
+        };
+        Action0 onTerminateDelegator = new Action0 () {
+                @Override
+                public void call() {
+                    onTerminated(dataState);
+                }
+            };
+        SubscriptionProducer<T> producer = new SubscriptionProducer<T>(subscriber, nextDelegator, onTerminateDelegator);
+        subscriber.add(new SubscriptionCompleter<T>(producer));
+        subscriber.setProducer(producer);
     }
     
     /**
@@ -202,12 +224,32 @@ public abstract class AbstractOnSubscribe<T, S> implements OnSubscribe<T> {
     }
 
     /** Function that returns null. */
-    private static final Func1<Object, Object> NULL_FUNC1 = new Func1<Object, Object>() {
+    private static final Func0<Object> NULL_FUNC1 = new Func0<Object>() {
         @Override
-        public Object call(Object t1) {
+        public Object call() {
             return null;
         }
     };
+
+    /**
+     * Creates an {@code AbstractOnSubscribe} instance which calls the provided {@code next} action.
+     * <p>
+     * This is a convenience method to help create {@code AbstractOnSubscribe} instances with the help of
+     * lambdas.
+     *
+     * @param <T> the value type
+     * @param <S> the per-subscriber user-defined state type
+     * @param next the next action to call
+     * @return an {@code AbstractOnSubscribe} instance
+     */
+    public static <T, S> AbstractOnSubscribe<T, S> create(final S initialState, Func2<BackPressureSubscriber<T>, S, S> next) {
+        Func0<? extends S> onStartFunc = new Func0<S>() {
+            @Override
+            public S call() {
+                return initialState;
+            }};
+        return create(next, onStartFunc, Actions.empty());
+    }
     
     /**
      * Creates an {@code AbstractOnSubscribe} instance which calls the provided {@code next} action.
@@ -220,11 +262,33 @@ public abstract class AbstractOnSubscribe<T, S> implements OnSubscribe<T> {
      * @param next the next action to call
      * @return an {@code AbstractOnSubscribe} instance
      */
-    public static <T, S> AbstractOnSubscribe<T, S> create(Action1<SubscriptionState<T, S>> next) {
+    public static <T, S> AbstractOnSubscribe<T, S> create(Func2<BackPressureSubscriber<T>, S, S> next) {
         @SuppressWarnings("unchecked")
-        Func1<? super Subscriber<? super T>, ? extends S> nullFunc =
-                (Func1<? super Subscriber<? super T>, ? extends S>)NULL_FUNC1;
+        Func0<? extends S> nullFunc = (Func0<? extends S>)NULL_FUNC1;
         return create(next, nullFunc, Actions.empty());
+    }
+    
+    /**
+     * Creates an {@code AbstractOnSubscribe} instance which calls the provided {@code next} action.
+     * <p>
+     * This is a convenience method to help create {@code AbstractOnSubscribe} instances with the help of
+     * lambdas.
+     *
+     * @param <T> the value type
+     * @param <S> the per-subscriber user-defined state type
+     * @param next the next action to call
+     * @return an {@code AbstractOnSubscribe} instance
+     */
+    public static <T, S> AbstractOnSubscribe<T, S> create(final Action1<BackPressureSubscriber<T>> next) {
+        @SuppressWarnings("unchecked")
+        Func0<? extends S> nullFunc = (Func0<? extends S>)NULL_FUNC1;
+        Func2<BackPressureSubscriber<T>, S, S> nextWrapper = new Func2<BackPressureSubscriber<T>, S, S>() {
+            @Override
+            public S call(BackPressureSubscriber<T> t1, S t2) {
+                next.call(t1);
+                return null;
+            }};
+        return create(nextWrapper, nullFunc, Actions.empty());
     }
 
     /**
@@ -237,12 +301,12 @@ public abstract class AbstractOnSubscribe<T, S> implements OnSubscribe<T> {
      * @param <T> the value type
      * @param <S> the per-subscriber user-defined state type
      * @param next the next action to call
-     * @param onSubscribe the function that returns a per-subscriber state to be used by {@code next}
+     * @param onStart the function that returns a per-subscriber state to be used by {@code next}
      * @return an {@code AbstractOnSubscribe} instance
      */
-    public static <T, S> AbstractOnSubscribe<T, S> create(Action1<SubscriptionState<T, S>> next,
-            Func1<? super Subscriber<? super T>, ? extends S> onSubscribe) {
-        return create(next, onSubscribe, Actions.empty());
+    public static <T, S> AbstractOnSubscribe<T, S> create(Func2<BackPressureSubscriber<T>, S, S> next,
+            Func0<? extends S> onStart) {
+        return create(next, onStart, Actions.empty());
     }
 
     /**
@@ -256,13 +320,14 @@ public abstract class AbstractOnSubscribe<T, S> implements OnSubscribe<T> {
      * @param <T> the value type
      * @param <S> the per-subscriber user-defined state type
      * @param next the next action to call
-     * @param onSubscribe the function that returns a per-subscriber state to be used by {@code next}
+     * @param onStart the function that returns a per-subscriber state to be used by {@code next}
      * @param onTerminated the action to call to release the state created by the {@code onSubscribe} function
      * @return an {@code AbstractOnSubscribe} instance
      */
-    public static <T, S> AbstractOnSubscribe<T, S> create(Action1<SubscriptionState<T, S>> next,
-            Func1<? super Subscriber<? super T>, ? extends S> onSubscribe, Action1<? super S> onTerminated) {
-        return new LambdaOnSubscribe<T, S>(next, onSubscribe, onTerminated);
+    public static <T, S> AbstractOnSubscribe<T, S> create(Func2<BackPressureSubscriber<T>, S, S> next,
+            Func0<? extends S> onStart, 
+            Action1<? super S> onTerminated) {
+        return new LambdaOnSubscribe<T, S>(next, onStart, onTerminated);
     }
 
     /**
@@ -273,26 +338,27 @@ public abstract class AbstractOnSubscribe<T, S> implements OnSubscribe<T> {
      * @param <S> the per-subscriber user-defined state type
      */
     private static final class LambdaOnSubscribe<T, S> extends AbstractOnSubscribe<T, S> {
-        final Action1<SubscriptionState<T, S>> next;
-        final Func1<? super Subscriber<? super T>, ? extends S> onSubscribe;
-        final Action1<? super S> onTerminated;
-        private LambdaOnSubscribe(Action1<SubscriptionState<T, S>> next,
-                Func1<? super Subscriber<? super T>, ? extends S> onSubscribe, Action1<? super S> onTerminated) {
+        private final Func2<BackPressureSubscriber<T>, ? super S, ? extends S> next;
+        private final Func0<? extends S> onStart;
+        private final Action1<? super S> onTerminated;
+        private LambdaOnSubscribe(Func2<BackPressureSubscriber<T>, ? super S, ? extends S> next,
+                Func0<? extends S> onSubscribe, 
+                Action1<? super S> onTerminated) {
             this.next = next;
-            this.onSubscribe = onSubscribe;
+            this.onStart = onSubscribe;
             this.onTerminated = onTerminated;
         }
         @Override
-        protected S onSubscribe(Subscriber<? super T> subscriber) {
-            return onSubscribe.call(subscriber);
+        protected S onStart() {
+            return dataState = onStart.call();
         }
         @Override
-        protected void onTerminated(S state) {
-            onTerminated.call(state);
+        protected void onTerminated(S dataState) {
+            onTerminated.call(dataState);
         }
         @Override
-        protected void next(SubscriptionState<T, S> state) {
-            next.call(state);
+        protected S next(BackPressureSubscriber<T> state, S dataState) {
+            return next.call(state, dataState);
         }
     }
 
@@ -302,10 +368,10 @@ public abstract class AbstractOnSubscribe<T, S> implements OnSubscribe<T> {
      * @param <T> the value type
      * @param <S> the per-subscriber user-defined state type
      */
-    private static final class SubscriptionCompleter<T, S> extends AtomicBoolean implements Subscription {
+    private static final class SubscriptionCompleter<T> extends AtomicBoolean implements Subscription {
         private static final long serialVersionUID = 7993888274897325004L;
-        private final SubscriptionState<T, S> state;
-        private SubscriptionCompleter(SubscriptionState<T, S> state) {
+        private final SubscriptionProducer<T> state;
+        private SubscriptionCompleter(SubscriptionProducer<T> state) {
             this.state = state;
         }
         @Override
@@ -318,36 +384,91 @@ public abstract class AbstractOnSubscribe<T, S> implements OnSubscribe<T> {
                 state.free();
             }
         }
-
     }
+    
+    /**
+     * Represents a per-subscription state for the {@code AbstractOnSubscribe} operation. It supports phasing
+     * and counts the number of times a value was requested by the downstream.
+     *
+     * @param <T> the value type 
+     * @since (if this graduates from Experimental/Beta to supported, replace this parenthetical with the release number)
+     * @Experimental
+     */
+    public static interface BackPressureSubscriber<T> {
+        /**
+         * Call this method to offer the next {@code onNext} value for the subscriber.
+         * 
+         * @param value the value to {@code onNext}
+         * @throws IllegalStateException if there is a value already offered but not taken or a terminal state
+         *         is reached
+         */
+        public void onNext(T value);
+        
+        /**
+         * Call this method to send an {@code onError} to the subscriber and terminate all further activities.
+         * If there is a pending {@code onNext}, that value is emitted to the subscriber followed by this
+         * exception.
+         * 
+         * @param e the exception to deliver to the client
+         * @throws IllegalStateException if the terminal state has been reached already
+         */
+        public void onError(Throwable e);
+        
+        /**
+         * Call this method to send an {@code onCompleted} to the subscriber and terminate all further
+         * activities. If there is a pending {@code onNext}, that value is emitted to the subscriber followed by
+         * this exception.
+         * 
+         * @throws IllegalStateException if the terminal state has been reached already
+         */
+        public void onCompleted();
+        /**
+         * Signals that there won't be any further events.
+         */
+        public void stop();
+    }
+
     /**
      * Contains the producer loop that reacts to downstream requests of work.
      *
      * @param <T> the value type
-     * @param <S> the per-subscriber user-defined state type
      */
-    private static final class SubscriptionProducer<T, S> implements Producer {
-        final SubscriptionState<T, S> state;
-        private SubscriptionProducer(SubscriptionState<T, S> state) {
-            this.state = state;
+    private static final class SubscriptionProducer<T> implements Producer, BackPressureSubscriber<T> {
+        private final AtomicLong requestCount;
+        private final Action1<BackPressureSubscriber<T>> next;
+        private Subscriber<? super T> subscriber;
+        private final AtomicInteger inUse = new AtomicInteger(1);
+        private final Action0 onTerminated;
+        private T theValue;
+        private boolean hasOnNext;
+        private boolean hasCompleted;
+        private boolean stopRequested;
+        private Throwable theException;
+
+        private SubscriptionProducer(Subscriber<? super T> subscriber, Action1<BackPressureSubscriber<T>> next, Action0 onTerminated) {
+            this.subscriber = subscriber;
+            this.next = next;
+            this.onTerminated = onTerminated;
+            this.requestCount = new AtomicLong();
         }
+        
         @Override
         public void request(long n) {
-            if (n > 0 && BackpressureUtils.getAndAddRequest(state.requestCount, n) == 0) {
+            if (n > 0 && BackpressureUtils.getAndAddRequest(requestCount, n) == 0) {
                 if (n == Long.MAX_VALUE) {
                     // fast-path
-                    for (; !state.subscriber.isUnsubscribed(); ) {
+                    while (!subscriber.isUnsubscribed()) {
                         if (!doNext()) {
                             break;
                         }
                     }
                 } else 
-                if (!state.subscriber.isUnsubscribed()) {
+                if (!subscriber.isUnsubscribed()) {
                     do {
                         if (!doNext()) {
                             break;
                         }
-                    } while (state.requestCount.decrementAndGet() > 0 && !state.subscriber.isUnsubscribed());
+                    } while (requestCount.decrementAndGet() > 0 && !subscriber.isUnsubscribed());
                 }
             }
         }
@@ -359,116 +480,28 @@ public abstract class AbstractOnSubscribe<T, S> implements OnSubscribe<T> {
          * @return true if the outer loop may continue
          */
         protected boolean doNext() {
-            if (state.use()) {
-                try {
-                    int p = state.phase();
-                    state.parent.next(state);
-                    if (!state.verify()) {
-                        throw new IllegalStateException("No event produced or stop called @ Phase: " + p + " -> " + state.phase() + ", Calls: " + state.calls());
-                    }
-                    if (state.accept() || state.stopRequested()) {
-                        state.terminate();
-                        return false;
-                    }
-                    state.calls++;
-                } catch (Throwable t) {
-                    state.terminate();
-                    state.subscriber.onError(t);
-                    return false;
-                } finally {
-                    state.free();
+            if (isInUse()) // TODO should we mark that a request has been made and that the thread currently using should process the request?
+                return false;
+            try {
+                next.call(this);
+                if (!verify()) {
+                    throw new IllegalStateException("No event produced or stop called when invoking generator func");
                 }
-                return true;
+                if (accept() || stopRequested()) {
+                    terminate();
+                    return false;
+                }
+            } catch (Throwable t) {
+                terminate();
+                subscriber.onError(t);
+                return false;
+            } finally {
+                free();
             }
-            return false;
+            return true;
         }
-    }
-
-    /**
-     * Represents a per-subscription state for the {@code AbstractOnSubscribe} operation. It supports phasing
-     * and counts the number of times a value was requested by the downstream.
-     *
-     * @param <T> the value type 
-     * @param <S> the per-subscriber user-defined state type
-     * @since (if this graduates from Experimental/Beta to supported, replace this parenthetical with the release number)
-     * @Experimental
-     */
-    public static final class SubscriptionState<T, S> {
-        private final AbstractOnSubscribe<T, S> parent;
-        private final Subscriber<? super T> subscriber;
-        private final S state;
-        private final AtomicLong requestCount;
-        private final AtomicInteger inUse;
-        private int phase;
-        private long calls;
-        private T theValue;
-        private boolean hasOnNext;
-        private boolean hasCompleted;
-        private boolean stopRequested;
-        private Throwable theException;
-        private SubscriptionState(AbstractOnSubscribe<T, S> parent, Subscriber<? super T> subscriber, S state) {
-            this.parent = parent;
-            this.subscriber = subscriber;
-            this.state = state;
-            this.requestCount = new AtomicLong();
-            this.inUse = new AtomicInteger(1);
-        }
-
-        /**
-         * @return the per-subscriber specific user-defined state created via
-         *         {@link AbstractOnSubscribe#onSubscribe}
-         */
-        public S state() {
-            return state;
-        }
-
-        /**
-         * @return the current phase value
-         */
-        public int phase() {
-            return phase;
-        }
-
-        /**
-         * Sets a new phase value.
-         *
-         * @param newPhase
-         */
-        public void phase(int newPhase) {
-            phase = newPhase;
-        }
-
-        /**
-         * Advance the current phase by 1.
-         */
-        public void advancePhase() {
-            advancePhaseBy(1);
-        }
-
-        /**
-         * Advance the current phase by the given amount (can be negative).
-         *
-         * @param amount the amount to advance the phase
-         */
-        public void advancePhaseBy(int amount) {
-            phase += amount;
-        }
-
-        /**
-         * @return the number of times {@link AbstractOnSubscribe#next} was called so far, starting at 0 for the
-         *         very first call
-         */
-        public long calls() {
-            return calls;
-        }
-
-        /**
-         * Call this method to offer the next {@code onNext} value for the subscriber.
-         * 
-         * @param value the value to {@code onNext}
-         * @throws IllegalStateException if there is a value already offered but not taken or a terminal state
-         *         is reached
-         */
+    
+        @Override
         public void onNext(T value) {
             if (hasOnNext) {
                 throw new IllegalStateException("onNext not consumed yet!");
@@ -480,14 +513,7 @@ public abstract class AbstractOnSubscribe<T, S> implements OnSubscribe<T> {
             hasOnNext = true;
         }
 
-        /**
-         * Call this method to send an {@code onError} to the subscriber and terminate all further activities.
-         * If there is a pending {@code onNext}, that value is emitted to the subscriber followed by this
-         * exception.
-         * 
-         * @param e the exception to deliver to the client
-         * @throws IllegalStateException if the terminal state has been reached already
-         */
+        @Override
         public void onError(Throwable e) {
             if (e == null) {
                 throw new NullPointerException("e != null required");
@@ -499,13 +525,7 @@ public abstract class AbstractOnSubscribe<T, S> implements OnSubscribe<T> {
             hasCompleted = true;
         }
 
-        /**
-         * Call this method to send an {@code onCompleted} to the subscriber and terminate all further
-         * activities. If there is a pending {@code onNext}, that value is emitted to the subscriber followed by
-         * this exception.
-         * 
-         * @throws IllegalStateException if the terminal state has been reached already
-         */
+        @Override
         public void onCompleted() {
             if (hasCompleted) {
                 throw new IllegalStateException("Already terminated", theException);
@@ -513,9 +533,7 @@ public abstract class AbstractOnSubscribe<T, S> implements OnSubscribe<T> {
             hasCompleted = true;
         }
 
-        /**
-         * Signals that there won't be any further events.
-         */
+        @Override
         public void stop() {
             stopRequested = true;
         }
@@ -581,13 +599,13 @@ public abstract class AbstractOnSubscribe<T, S> implements OnSubscribe<T> {
          * @throws IllegalStateEception
          * @warn "throws" section incomplete
          */
-        protected boolean use() {
+        protected boolean isInUse() {
             int i = inUse.get();
             if (i == 0) {
-                return false;
+                return true;
             } else
             if (i == 1 && inUse.compareAndSet(1, 2)) {
-                return true;
+                return false;
             }
             throw new IllegalStateException("This is not reentrant nor threadsafe!");
         }
@@ -601,7 +619,7 @@ public abstract class AbstractOnSubscribe<T, S> implements OnSubscribe<T> {
                 return;
             } else
             if (inUse.decrementAndGet() == 0) {
-                parent.onTerminated(state);
+                onTerminated.call();
             }
         }
 
@@ -616,10 +634,11 @@ public abstract class AbstractOnSubscribe<T, S> implements OnSubscribe<T> {
                     return;
                 }
                 if (inUse.compareAndSet(i, 0)) {
-                    parent.onTerminated(state);
+                    onTerminated.call();
                     break;
                 }
             }
         }
     }
+
 }
