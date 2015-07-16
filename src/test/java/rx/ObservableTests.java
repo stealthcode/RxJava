@@ -37,6 +37,7 @@ import java.util.NoSuchElementException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.Before;
@@ -46,6 +47,7 @@ import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
 
 import rx.Observable.OnSubscribe;
+import rx.Observable.Operator;
 import rx.Observable.Transformer;
 import rx.exceptions.OnErrorNotImplementedException;
 import rx.functions.Action1;
@@ -53,6 +55,8 @@ import rx.functions.Action2;
 import rx.functions.Func0;
 import rx.functions.Func1;
 import rx.functions.Func2;
+import rx.internal.operators.OperatorAll;
+import rx.internal.operators.OperatorMap;
 import rx.observables.ConnectableObservable;
 import rx.observers.TestSubscriber;
 import rx.schedulers.TestScheduler;
@@ -1137,5 +1141,20 @@ public class ObservableTests {
         subscription.unsubscribe();
 
         subscriber.assertUnsubscribed();
+    }
+    
+    @Test
+    public void testExtend() {
+        final TestSubscriber<Object> subscriber = new TestSubscriber<Object>();
+        final Object value = new Object();
+        Observable.just(value).x(new ConversionFunc<Object,Object>(){
+            @Override
+            public Object convert(OnSubscribe<Object> onSubscribe) {
+                onSubscribe.call(subscriber);
+                subscriber.assertNoErrors();
+                subscriber.assertCompleted();
+                subscriber.assertValue(value);
+                return subscriber.getOnNextEvents().get(0);
+            }});
     }
 }
