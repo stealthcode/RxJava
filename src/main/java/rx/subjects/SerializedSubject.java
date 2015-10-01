@@ -16,7 +16,6 @@
 package rx.subjects;
 
 import rx.Subscriber;
-import rx.annotations.Experimental;
 import rx.observers.SerializedObserver;
 
 /**
@@ -69,6 +68,7 @@ public class SerializedSubject<T, R> extends Subject<T, R> {
     public boolean hasObservers() {
         return actual.hasObservers();
     }
+<<<<<<< HEAD
     
     /**
      * {@inheritDoc}
@@ -140,4 +140,6 @@ public class SerializedSubject<T, R> extends Subject<T, R> {
     public T[] getValues(T[] a) {
         return actual.getValues(a);
     }
+=======
+>>>>>>> 1.1.0: Subject state methods beta/remove
 }
